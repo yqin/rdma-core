@@ -2141,6 +2141,198 @@ static void umr_strided_seg_create(struct mlx5_qp *qp,
 	*xlat_size = (num_interleaved + 1) * sizeof(*eb);
 }
 
+static int umr_sg_list_create_noninline(struct mlx5_qp *qp,
+                                        uint16_t num_sges,
+                                        struct ibv_sge *sge,
+                                        void *seg,
+                                        void *qend,
+                                        uint32_t ptr_mkey,
+                                        void *ptr_address,
+                                        int *size,
+                                        int *xlat_size,
+                                        uint64_t *reglen)
+{
+    struct mlx5_wqe_umr_pointer_seg *pseg;
+	struct mlx5_wqe_umr_klm_seg *dseg;
+	int byte_count = 0;
+	int i;
+	//size_t tmp;
+
+    /* set pointer segment */
+    pseg = seg;
+    pseg->mkey = htobe32(ptr_mkey);
+    pseg->address = htobe64((uint64_t)ptr_address);
+
+    /* set actual KLM segments, make sure ptr_address is 2KB aligned */
+	dseg = ptr_address;
+
+	for (i = 0; i < num_sges; i++, dseg++) {
+		dseg->address = htobe64(sge[i].addr);
+		dseg->mkey = htobe32(sge[i].lkey);
+		dseg->byte_count = htobe32(sge[i].length);
+		byte_count += sge[i].length;
+	}
+
+    /* YQ: Do we still need this? */
+#if 0
+	tmp = align(num_sges, 4) - num_sges;
+	memset(dseg, 0, tmp * sizeof(*dseg));
+
+	*size = align(num_sges * sizeof(*dseg), 64);
+#else
+    *size = sizeof(*pseg);
+#endif
+
+    *reglen = byte_count;
+    *xlat_size = num_sges * sizeof(*dseg);
+
+	return 0;
+}
+
+/* The strided block format is as the following:
+ * | repeat_block | entry_block | entry_block |...| entry_block |
+ * While the repeat entry contains details on the list of the block_entries.
+ */
+static void umr_strided_seg_create_noninline(struct mlx5_qp *qp,
+                                             uint32_t repeat_count,
+                                             uint16_t num_interleaved,
+                                             struct mlx5dv_mr_interleaved *data,
+                                             void *seg,
+                                             void *qend,
+                                             uint32_t ptr_mkey,
+                                             void *ptr_address,
+                                             int *wqe_size,
+                                             int *xlat_size,
+                                             uint64_t *reglen)
+{
+    struct mlx5_wqe_umr_pointer_seg *pseg;
+	struct mlx5_wqe_umr_repeat_block_seg *rb;
+	struct mlx5_wqe_umr_repeat_ent_seg *eb;
+	uint64_t byte_count = 0;
+	//int tmp;
+	int i;
+
+    /* set pointer segment */
+    pseg = seg;
+    pseg->mkey = htobe32(ptr_mkey);
+    pseg->address = htobe64((uint64_t)ptr_address);
+
+    /* set actual repeated and entry blocks segments */
+    rb = ptr_address;
+	rb->op = htobe32(0x400);
+	rb->reserved = 0;
+	rb->num_ent = htobe16(num_interleaved);
+	rb->repeat_count = htobe32(repeat_count);
+	eb = rb->entries;
+
+	/*
+	 * ------------------------------------------------------------
+	 * | repeat_block | entry_block | entry_block |...| entry_block
+	 * ------------------------------------------------------------
+	 */
+	for (i = 0; i < num_interleaved; i++, eb++) {
+		byte_count += data[i].bytes_count;
+		eb->va = htobe64(data[i].addr);
+		eb->byte_count = htobe16(data[i].bytes_count);
+		eb->stride = htobe16(data[i].bytes_count + data[i].bytes_skip);
+		eb->memkey = htobe32(data[i].lkey);
+	}
+
+	rb->byte_count = htobe32(byte_count);
+	*reglen = byte_count * repeat_count;
+
+    /* YQ: do we still need this? */
+#if 0
+	tmp = align(num_interleaved + 1, 4) - num_interleaved - 1;
+	memset(eb, 0, tmp * sizeof(*eb));
+
+	*wqe_size = align(sizeof(*rb) + sizeof(*eb) * num_interleaved, 64);
+#else
+    *wqe_size = sizeof(*rb) + sizeof(*eb) * num_interleaved;
+#endif
+	*xlat_size = (num_interleaved + 1) * sizeof(*eb);
+}
+
+/* External API to expose the non-inline UMR registration */
+static void mlx5_send_wr_mr_noninline(struct mlx5dv_qp_ex *dv_qp,
+                                      struct mlx5dv_mkey *dv_mkey,
+                                      uint32_t access_flags,
+                                      uint32_t repeat_count,
+                                      uint16_t num_entries,
+                                      struct mlx5dv_mr_interleaved *data,
+                                      struct ibv_sge *sge,
+                                      uint32_t ptr_mkey,
+                                      void *ptr_address)
+{
+	struct mlx5_qp *mqp = mqp_from_mlx5dv_qp_ex(dv_qp);
+	struct ibv_qp_ex *ibqp = &mqp->verbs_qp.qp_ex;
+	struct mlx5_wqe_umr_ctrl_seg *umr_ctrl_seg;
+	struct mlx5_wqe_mkey_context_seg *mk_seg;
+	int xlat_size;
+	int size;
+	uint64_t reglen = 0;
+	void *qend = mqp->sq.qend;
+	void *seg;
+
+	if (unlikely(!check_comp_mask(access_flags,
+				      IBV_ACCESS_LOCAL_WRITE |
+				      IBV_ACCESS_REMOTE_WRITE |
+				      IBV_ACCESS_REMOTE_READ |
+				      IBV_ACCESS_REMOTE_ATOMIC))) {
+		mqp->err = EINVAL;
+		return;
+	}
+
+	_common_wqe_init(ibqp, IBV_WR_DRIVER1);
+	mqp->cur_size = sizeof(struct mlx5_wqe_ctrl_seg) / 16;
+	mqp->cur_ctrl->imm = htobe32(dv_mkey->lkey);
+	seg = umr_ctrl_seg = (void *)mqp->cur_ctrl + sizeof(struct mlx5_wqe_ctrl_seg);
+
+	memset(umr_ctrl_seg, 0, sizeof(*umr_ctrl_seg));
+	umr_ctrl_seg->mkey_mask = htobe64(MLX5_WQE_UMR_CTRL_MKEY_MASK_LEN	|
+		MLX5_WQE_UMR_CTRL_MKEY_MASK_ACCESS_LOCAL_WRITE	|
+		MLX5_WQE_UMR_CTRL_MKEY_MASK_ACCESS_REMOTE_READ	|
+		MLX5_WQE_UMR_CTRL_MKEY_MASK_ACCESS_REMOTE_WRITE	|
+		MLX5_WQE_UMR_CTRL_MKEY_MASK_ACCESS_ATOMIC	|
+		MLX5_WQE_UMR_CTRL_MKEY_MASK_FREE);
+
+	seg += sizeof(struct mlx5_wqe_umr_ctrl_seg);
+	mqp->cur_size += sizeof(struct mlx5_wqe_umr_ctrl_seg) / 16;
+
+	if (unlikely(seg == qend))
+		seg = mlx5_get_send_wqe(mqp, 0);
+
+	mk_seg = seg;
+	memset(mk_seg, 0, sizeof(*mk_seg));
+	mk_seg->access_flags = get_umr_mr_flags(access_flags);
+	mk_seg->qpn_mkey = htobe32(0xffffff00 | (dv_mkey->lkey & 0xff));
+
+	seg += sizeof(struct mlx5_wqe_mkey_context_seg);
+	mqp->cur_size += (sizeof(struct mlx5_wqe_mkey_context_seg) / 16);
+
+	if (unlikely(seg == qend))
+		seg = mlx5_get_send_wqe(mqp, 0);
+
+	if (data)
+		umr_strided_seg_create_noninline(mqp, repeat_count, num_entries, data,
+				                         seg, qend, ptr_mkey, ptr_address,
+                                         &size, &xlat_size, &reglen);
+	else
+		umr_sg_list_create_noninline(mqp, num_entries, sge, seg, qend, ptr_mkey,
+                                     ptr_address, &size, &xlat_size, &reglen);
+
+	mk_seg->len = htobe64(reglen);
+	umr_ctrl_seg->klm_octowords = htobe16(align(xlat_size, 64) / 16);
+	mqp->cur_size += size / 16;
+
+	mqp->fm_cache = MLX5_WQE_CTRL_INITIATOR_SMALL_FENCE;
+	mqp->nreq++;
+    /* YQ: Do we still need this? What is inl_wqe? */
+	//mqp->inl_wqe = 1;
+
+	_common_wqe_finilize(mqp);
+}
+
 static void mlx5_send_wr_mr(struct mlx5dv_qp_ex *dv_qp,
 			    struct mlx5dv_mkey *dv_mkey,
 			    uint32_t access_flags,
@@ -2413,6 +2605,7 @@ int mlx5_qp_fill_wr_pfns(struct mlx5_qp *mqp,
 			dv_qp = &mqp->dv_qp;
 			dv_qp->wr_mr_interleaved = mlx5_send_wr_mr_interleaved;
 			dv_qp->wr_mr_list = mlx5_send_wr_mr_list;
+            dv_qp->wr_mr_noninline = mlx5_send_wr_mr_noninline;
 		}
 
 		break;

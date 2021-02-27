@@ -261,6 +261,15 @@ struct mlx5dv_qp_ex {
 			   uint32_t access_flags, /* use enum ibv_access_flags */
 			   uint16_t num_sges,
 			   struct ibv_sge *sge);
+    void (*wr_mr_noninline)(struct mlx5dv_qp_ex *dv_qp,
+                            struct mlx5dv_mkey *dv_mkey,
+                            uint32_t access_flags,
+                            uint32_t repeat_count,
+                            uint16_t num_entries,
+                            struct mlx5dv_mr_interleaved *data,
+                            struct ibv_sge *sge,
+                            uint32_t ptr_mkey,
+                            void *ptr_address);
 };
 
 struct mlx5dv_qp_ex *mlx5dv_qp_ex_from_ibv_qp_ex(struct ibv_qp_ex *qp);
@@ -921,6 +930,13 @@ struct mlx5_wqe_umr_klm_seg {
 	__be32		byte_count;
 	__be32		mkey;
 	__be64		address;
+};
+
+/* UMR pointer to KLMs/MTTs/RepeatBlock and BSFs location (when inline = 0) */
+struct mlx5_wqe_umr_pointer_seg {
+    __be32      reserved;
+    __be32      mkey;
+    __be64      address;
 };
 
 union mlx5_wqe_umr_inline_seg {
