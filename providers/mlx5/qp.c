@@ -2148,15 +2148,15 @@ static int umr_sg_list_create_noninline(struct mlx5_qp *qp,
                                         void *qend,
                                         uint32_t ptr_mkey,
                                         void *ptr_address,
-                                        int *size,
+                                        int *wqe_size,
                                         int *xlat_size,
                                         uint64_t *reglen)
 {
     struct mlx5_wqe_umr_pointer_seg *pseg;
 	struct mlx5_wqe_umr_klm_seg *dseg;
-	int byte_count = 0;
+	uint64_t byte_count = 0;
+	size_t tmp;
 	int i;
-	//size_t tmp;
 
     /* set pointer segment */
     pseg = seg;
@@ -2173,16 +2173,11 @@ static int umr_sg_list_create_noninline(struct mlx5_qp *qp,
 		byte_count += sge[i].length;
 	}
 
-    /* YQ: Do we still need this? */
-#if 0
+    /* fill padding area */
 	tmp = align(num_sges, 4) - num_sges;
 	memset(dseg, 0, tmp * sizeof(*dseg));
 
-	*size = align(num_sges * sizeof(*dseg), 64);
-#else
-    *size = sizeof(*pseg);
-#endif
-
+    *wqe_size = sizeof(*pseg);
     *reglen = byte_count;
     *xlat_size = num_sges * sizeof(*dseg);
 
@@ -2209,7 +2204,7 @@ static void umr_strided_seg_create_noninline(struct mlx5_qp *qp,
 	struct mlx5_wqe_umr_repeat_block_seg *rb;
 	struct mlx5_wqe_umr_repeat_ent_seg *eb;
 	uint64_t byte_count = 0;
-	//int tmp;
+	size_t tmp;
 	int i;
 
     /* set pointer segment */
@@ -2239,17 +2234,12 @@ static void umr_strided_seg_create_noninline(struct mlx5_qp *qp,
 	}
 
 	rb->byte_count = htobe32(byte_count);
-	*reglen = byte_count * repeat_count;
 
-    /* YQ: do we still need this? */
-#if 0
 	tmp = align(num_interleaved + 1, 4) - num_interleaved - 1;
 	memset(eb, 0, tmp * sizeof(*eb));
 
-	*wqe_size = align(sizeof(*rb) + sizeof(*eb) * num_interleaved, 64);
-#else
-    *wqe_size = sizeof(*rb) + sizeof(*eb) * num_interleaved;
-#endif
+    *wqe_size = sizeof(*pseg);
+	*reglen = byte_count * repeat_count;
 	*xlat_size = (num_interleaved + 1) * sizeof(*eb);
 }
 
